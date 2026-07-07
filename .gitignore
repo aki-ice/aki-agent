@@ -49,3 +49,4 @@ dist/
 
 # Packaging local outputs
 *.spec
+!packaging/pyinstaller.spec
