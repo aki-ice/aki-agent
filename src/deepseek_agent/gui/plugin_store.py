@@ -140,6 +140,36 @@ class PluginStore:
             "trusted": 1,
         },
         {
+            "id": "tool.run_command", "type": "tool", "name": "run_command", "version": "1.0.0",
+            "description": "Run approved terminal commands inside the workspace.", "source": "builtin", "entry_path": "run_command", "trusted": 1,
+        },
+        {
+            "id": "tool.process_control", "type": "tool", "name": "process_control", "version": "1.0.0",
+            "description": "Manage background processes started by the agent.", "source": "builtin", "entry_path": "process_control", "trusted": 1,
+        },
+        {
+            "id": "tool.run_code", "type": "tool", "name": "run_code", "version": "1.0.0",
+            "description": "Execute Python, JavaScript, or TypeScript source files.", "source": "builtin", "entry_path": "run_code", "trusted": 1,
+        },
+        {
+            "id": "tool.git", "type": "tool", "name": "git", "version": "1.0.0",
+            "description": "Inspect and modify the workspace Git repository.", "source": "builtin", "entry_path": "git", "trusted": 1,
+        },
+        {
+            "id": "tool.docker_sandbox", "type": "tool", "name": "docker_sandbox", "version": "1.0.0",
+            "description": "Run commands in a restricted Docker sandbox.", "source": "builtin", "entry_path": "docker_sandbox", "trusted": 1,
+        },
+        {
+            "id": "tool.paddle_ocr",
+            "type": "tool",
+            "name": "paddle_ocr",
+            "version": "1.0.0",
+            "description": "Parse local files or public file URLs with PaddleOCR AIStudio and return Markdown.",
+            "source": "builtin",
+            "entry_path": "paddle_ocr",
+            "trusted": 1,
+        },
+        {
             "id": "tool.web_search",
             "type": "tool",
             "name": "web_search",
@@ -203,6 +233,8 @@ class PluginStore:
             )
 
     def sync_builtins(self) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM plugins WHERE id = ? AND source = 'builtin'", ("tool.dots_ocr",))
         for plugin in self._scan_builtin_skills():
             self.upsert_plugin(plugin, keep_enabled=True)
         for tool in self.BUILTIN_TOOLS:

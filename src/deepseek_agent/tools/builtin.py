@@ -7,11 +7,15 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import urllib.parse
 import urllib.request
 from typing import Any
 
+import requests
+
 from .base import BaseTool, ToolDefinition, ToolParameter, ToolRegistry
+from .execution import DockerSandboxTool, GitTool, ProcessTool, RunCodeTool, RunCommandTool
 
 
 class CalculatorTool(BaseTool):
@@ -428,6 +432,166 @@ class MovePathTool(FileToolMixin, BaseTool):
             return f"Moved path: {src} -> {dst}"
         except Exception as exc:
             return f"Move error: {exc}"
+
+
+class PaddleOcrTool(FileToolMixin, BaseTool):
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="paddle_ocr",
+            description="Parse a local document/image or public file URL with the PaddleOCR AIStudio asynchronous Job API and return Markdown.",
+            parameters=[
+                ToolParameter("path", "string", "Local file path or HTTP(S) file URL."),
+                ToolParameter("output_dir", "string", "Optional directory for saving per-page Markdown and downloaded images.", required=False),
+                ToolParameter("download_images", "boolean", "Download Markdown and output images when output_dir is set (default false).", required=False),
+                ToolParameter("timeout", "integer", "Maximum polling time in seconds (default 600).", required=False),
+                ToolParameter("use_doc_orientation_classify", "boolean", "Enable document orientation classification (default false).", required=False),
+                ToolParameter("use_doc_unwarping", "boolean", "Enable document unwarping (default false).", required=False),
+                ToolParameter("use_chart_recognition", "boolean", "Enable chart recognition (default false).", required=False),
+            ],
+        )
+
+    def execute(
+        self,
+        path: str = "",
+        output_dir: str = "",
+        download_images: bool = False,
+        timeout: int = 600,
+        use_doc_orientation_classify: bool = False,
+        use_doc_unwarping: bool = False,
+        use_chart_recognition: bool = False,
+        _cancellation_token: Any = None,
+        **_: Any,
+    ) -> str:
+        if not path:
+            return "OCR error: path is required"
+        token = os.getenv("PADDLEOCR_API_TOKEN", "").strip()
+        if not token:
+            return "OCR error: PADDLEOCR_API_TOKEN is not configured in .env"
+        job_url = os.getenv("PADDLEOCR_JOB_URL", "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs").strip()
+        model = os.getenv("PADDLEOCR_MODEL", "PaddleOCR-VL-1.6").strip() or "PaddleOCR-VL-1.6"
+        headers = {"Authorization": f"bearer {token}"}
+        optional_payload = {
+            "useDocOrientationClassify": bool(use_doc_orientation_classify),
+            "useDocUnwarping": bool(use_doc_unwarping),
+            "useChartRecognition": bool(use_chart_recognition),
+        }
+        try:
+            job_id = self._submit_job(path, job_url, model, headers, optional_payload)
+            result_url, progress = self._wait_for_job(job_url, job_id, headers, max(30, int(timeout or 600)), _cancellation_token)
+            markdown_pages, downloaded = self._collect_results(result_url, output_dir, download_images)
+            if not markdown_pages:
+                return f"OCR error: job {job_id} completed but returned no Markdown pages"
+            markdown = "\n\n".join(f"## Page {index}\n\n{text.strip()}" for index, text in enumerate(markdown_pages, 1))
+            if output_dir:
+                out = self._resolve_path(output_dir)
+                combined_path = os.path.join(out, "document.md")
+                os.makedirs(out, exist_ok=True)
+                with open(combined_path, "w", encoding="utf-8") as fh:
+                    fh.write(markdown)
+                return f"OCR completed: job={job_id}; pages={len(markdown_pages)}; saved={combined_path}; downloaded_images={downloaded}; progress={progress}"
+            return markdown
+        except Exception as exc:
+            return f"OCR error: {exc}"
+
+    def _submit_job(self, path: str, job_url: str, model: str, headers: dict[str, str], optional_payload: dict[str, bool]) -> str:
+        if path.lower().startswith(("http://", "https://")):
+            response = requests.post(
+                job_url,
+                json={"fileUrl": path, "model": model, "optionalPayload": optional_payload},
+                headers={**headers, "Content-Type": "application/json"},
+                timeout=120,
+            )
+        else:
+            full = self._resolve_path(path)
+            if not os.path.isfile(full):
+                raise FileNotFoundError(f"file not found: {path}")
+            with open(full, "rb") as fh:
+                response = requests.post(
+                    job_url,
+                    headers=headers,
+                    data={"model": model, "optionalPayload": json.dumps(optional_payload)},
+                    files={"file": (os.path.basename(full), fh)},
+                    timeout=300,
+                )
+        self._raise_api_error(response, "submit job")
+        job_id = response.json().get("data", {}).get("jobId")
+        if not job_id:
+            raise RuntimeError(f"submit response missing jobId: {response.text[:500]}")
+        return str(job_id)
+
+    def _wait_for_job(self, job_url: str, job_id: str, headers: dict[str, str], timeout: int, cancellation_token: Any = None) -> tuple[str, str]:
+        deadline = time.monotonic() + timeout
+        last_progress = "pending"
+        while time.monotonic() < deadline:
+            if cancellation_token:
+                cancellation_token.raise_if_cancelled()
+            response = requests.get(f"{job_url.rstrip('/')}/{job_id}", headers=headers, timeout=60)
+            self._raise_api_error(response, "poll job")
+            data = response.json().get("data", {})
+            state = str(data.get("state", ""))
+            progress = data.get("extractProgress") or {}
+            if progress:
+                last_progress = f"{progress.get('extractedPages', 0)}/{progress.get('totalPages', '?')}"
+            else:
+                last_progress = state or last_progress
+            if state == "done":
+                json_url = (data.get("resultUrl") or {}).get("jsonUrl")
+                if not json_url:
+                    raise RuntimeError("completed job response missing resultUrl.jsonUrl")
+                return str(json_url), last_progress
+            if state == "failed":
+                raise RuntimeError(str(data.get("errorMsg") or "PaddleOCR job failed"))
+            if cancellation_token:
+                if cancellation_token.wait(5):
+                    cancellation_token.raise_if_cancelled()
+            else:
+                time.sleep(5)
+        raise TimeoutError(f"PaddleOCR job {job_id} timed out after {timeout}s; last progress={last_progress}")
+
+    def _collect_results(self, jsonl_url: str, output_dir: str, download_images: bool) -> tuple[list[str], int]:
+        response = requests.get(jsonl_url, timeout=120)
+        response.raise_for_status()
+        output = self._resolve_path(output_dir) if output_dir else ""
+        if output:
+            os.makedirs(output, exist_ok=True)
+        pages: list[str] = []
+        downloaded = 0
+        for line in response.text.splitlines():
+            if not line.strip():
+                continue
+            result = json.loads(line).get("result", {})
+            for parsed in result.get("layoutParsingResults", []):
+                markdown_data = parsed.get("markdown") or {}
+                text = str(markdown_data.get("text", ""))
+                pages.append(text)
+                page_index = len(pages) - 1
+                if output:
+                    with open(os.path.join(output, f"doc_{page_index}.md"), "w", encoding="utf-8") as fh:
+                        fh.write(text)
+                if output and download_images:
+                    downloaded += self._download_image_map(markdown_data.get("images") or {}, output, "")
+                    downloaded += self._download_image_map(parsed.get("outputImages") or {}, output, f"page_{page_index}_")
+        return pages, downloaded
+
+    def _download_image_map(self, images: dict[str, str], output_dir: str, prefix: str) -> int:
+        downloaded = 0
+        for name, url in images.items():
+            safe_name = str(name).replace("\\", "/").lstrip("/")
+            safe_parts = [part for part in safe_name.split("/") if part not in {"", ".", ".."}]
+            safe_name = os.path.join(*safe_parts) if safe_parts else "image.bin"
+            destination = os.path.join(output_dir, prefix + safe_name)
+            os.makedirs(os.path.dirname(destination) or output_dir, exist_ok=True)
+            response = requests.get(str(url), timeout=120)
+            if response.ok:
+                with open(destination, "wb") as fh:
+                    fh.write(response.content)
+                downloaded += 1
+        return downloaded
+
+    def _raise_api_error(self, response: requests.Response, action: str) -> None:
+        if response.status_code != 200:
+            raise RuntimeError(f"{action} failed with HTTP {response.status_code}: {response.text[:1000]}")
 
 
 class WebSearchTool(BaseTool):
@@ -855,6 +1019,12 @@ def register_builtin_tools(registry: ToolRegistry, workspace_root: str = ".", en
         DeletePathTool(workspace_root),
         CopyPathTool(workspace_root),
         MovePathTool(workspace_root),
+        RunCommandTool(workspace_root),
+        ProcessTool(),
+        RunCodeTool(workspace_root),
+        GitTool(workspace_root),
+        DockerSandboxTool(workspace_root),
+        PaddleOcrTool(workspace_root),
         WebSearchTool(),
         HotNewsTool(),
         WebFetchTool(),

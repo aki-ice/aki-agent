@@ -118,9 +118,12 @@ class TokensPage(QWidget):
         title = QLabel("令牌用量")
         title.setStyleSheet(f"color: {C['text']}; font-family: {FONT_SERIF}; font-size: 24px; font-weight: 900;")
         layout.addWidget(title)
-        desc = QLabel("跟踪历史 Token 消耗和活跃情况。")
+        desc = QLabel("跟踪历史 Token 消耗和活跃情况。真实用量来自模型 Provider；不返回 Usage 时会标记为估算。")
+        self._usage_quality = QLabel("Usage: provider / estimated fallback")
+        self._usage_quality.setStyleSheet(f"color: {C['warning']}; font-size: 10px;")
         desc.setStyleSheet(f"color: {C['muted']}; font-size: 11px;")
         layout.addWidget(desc)
+        layout.addWidget(self._usage_quality)
 
         cards = QGridLayout()
         cards.setSpacing(14)

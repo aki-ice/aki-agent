@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QScrollArea, QTextEdit, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QTextEdit, QVBoxLayout, QWidget
 
 from .chat_store import ChatSession
 from .theme import C, FONT_SERIF, input_style, primary_button_style, secondary_button_style, shadow
@@ -12,11 +12,13 @@ MAX_BUBBLE_WIDTH = 680
 
 
 class ChatPage(QWidget):
+    stop_requested = pyqtSignal()
     send_message = pyqtSignal(str)
     clear_requested = pyqtSignal()
     new_session_requested = pyqtSignal()
     session_selected = pyqtSignal(int)
     delete_session_requested = pyqtSignal()
+    search_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -46,6 +48,12 @@ class ChatPage(QWidget):
         new_btn.clicked.connect(self.new_session_requested.emit)
         new_btn.setStyleSheet(primary_button_style(10))
         sl.addWidget(new_btn)
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("全文搜索会话...")
+        self._search_input.setStyleSheet(input_style())
+        self._search_input.returnPressed.connect(lambda: self.search_requested.emit(self._search_input.text()))
+        self._search_input.textChanged.connect(lambda text: self.search_requested.emit(text) if not text else None)
+        sl.addWidget(self._search_input)
         self._session_list = QListWidget()
         self._session_list.setStyleSheet(f"QListWidget {{ background-color: {C['panel_soft']}; border: none; color: {C['text']}; }} QListWidget::item {{ padding: 10px 8px; border-radius: 10px; margin: 2px 0; }} QListWidget::item:selected {{ background-color: {C['panel_deep']}; color: {C['primary']}; }}")
         self._session_list.currentItemChanged.connect(self._on_session_item_changed)
@@ -106,12 +114,16 @@ class ChatPage(QWidget):
         hint.setStyleSheet(f"color: {C['muted']}; font-size: 10px;")
         br.addWidget(hint)
         br.addStretch()
+        attach_btn = QPushButton("文档 / 图片")
+        attach_btn.clicked.connect(self._attach_document)
+        attach_btn.setStyleSheet(secondary_button_style())
+        br.addWidget(attach_btn)
         clear_btn = QPushButton("清空当前显示")
         clear_btn.clicked.connect(self.clear_chat)
         clear_btn.setStyleSheet(secondary_button_style())
         br.addWidget(clear_btn)
         self._send_btn = QPushButton("发送")
-        self._send_btn.clicked.connect(self._do_send)
+        self._send_btn.clicked.connect(self._send_or_stop)
         self._send_btn.setStyleSheet(primary_button_style())
         br.addWidget(self._send_btn)
         il.addLayout(br)
@@ -176,12 +188,37 @@ class ChatPage(QWidget):
             if item.widget(): item.widget().deleteLater()
             elif item.layout(): self._clear_layout(item.layout())
 
+    def _attach_document(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择图片或 PDF",
+            "",
+            "Documents (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff *.pdf *.doc *.docx *.ppt *.pptx *.xls *.xlsx);;Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff);;PDF (*.pdf);;Office (*.doc *.docx *.ppt *.pptx *.xls *.xlsx);;All files (*)",
+        )
+        if not path:
+            return
+        current = self._input.toPlainText().strip()
+        instruction = f'请使用 paddle_ocr 工具解析文件："{path}"，并根据识别内容回答我的问题。'
+        self._input.setPlainText(f"{current}\n\n{instruction}".strip())
+        self._input.setFocus()
+        QMessageBox.information(self, "已添加", "文件路径已加入消息。发送后 Agent 会调用 paddle_ocr。")
+
+    def _send_or_stop(self) -> None:
+        if self._sending:
+            self._send_btn.setEnabled(False)
+            self._send_btn.setText("停止中...")
+            self.stop_requested.emit()
+            return
+        self._do_send()
+
     def _do_send(self) -> None:
         if self._sending: return
         text = self._input.toPlainText().strip()
         if not text: return
         self._sending = True
-        self._send_btn.setEnabled(False)
+        self._send_btn.setEnabled(True)
+        self._send_btn.setText("停止")
+        self._send_btn.setStyleSheet(secondary_button_style())
         self._status_indicator.setText("● Thinking")
         self._status_indicator.setStyleSheet(f"color: {C['warning']}; font-size: 11px; font-weight: 800;")
         if self._empty:
@@ -236,6 +273,7 @@ class ChatPage(QWidget):
     def _reset_ui(self) -> None:
         self._sending = False
         self._send_btn.setEnabled(True)
+        self._send_btn.setText("发送")
         self._send_btn.setStyleSheet(primary_button_style())
         self._status_indicator.setText("● Ready")
         self._status_indicator.setStyleSheet(f"color: {C['success']}; font-size: 11px; font-weight: 800;")

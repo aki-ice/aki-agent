@@ -7,7 +7,9 @@ from typing import Any
 
 from openai import OpenAI
 
+from .context import ContextManager
 from .memory import ConversationMemory, LongTermMemory, MemoryEntry
+from .runtime import RunContext, Usage
 from .rag import Retriever
 from .skill import SkillRegistry
 from .tools import ToolExecutor, ToolRegistry, load_external_tool, register_builtin_tools
@@ -36,6 +38,7 @@ class DeepSeekAgent:
     rag_max_context_chars: int = 4000
     memory_db_path: str = "memory.db"
     rag_store_path: str = "rag_store.pkl"
+    retriever: Retriever | None = None
     workspace_root: str = "."
     skills_dir: str = ""
     enabled_skill_paths: list[str] = field(default_factory=list)
@@ -54,7 +57,8 @@ class DeepSeekAgent:
         self.tool_registry = ToolRegistry()
         self.skill_registry = SkillRegistry()
         self.long_term_memory: LongTermMemory | None = None
-        self.retriever: Retriever | None = None
+        if self.retriever is None:
+            self.retriever = None
 
         # ---- initialise sub-systems ----
         if self.enable_tools:
@@ -71,7 +75,7 @@ class DeepSeekAgent:
                 embedder=shared_embedder,
             )
 
-        if self.enable_rag:
+        if self.enable_rag and self.retriever is None:
             self.retriever = Retriever(
                 embedder_backend="hash",
                 store_path=self.rag_store_path,
@@ -105,6 +109,8 @@ class DeepSeekAgent:
             self.system_prompt = self.system_prompt + "\n\n" + skill_prompt
             self.conv_memory = ConversationMemory(system_prompt=self.system_prompt)
 
+        self.context_manager = ContextManager(model=self.model)
+        self.last_usage = Usage()
         self.tool_executor = ToolExecutor(
             client=self.client, model=self.model,
             registry=self.tool_registry, max_rounds=self.max_tool_rounds,
@@ -116,7 +122,7 @@ class DeepSeekAgent:
     def reset(self) -> None:
         self.conv_memory.reset()
 
-    def ask(self, user_input: str) -> str:
+    def ask(self, user_input: str, run_context: RunContext | None = None) -> str:
         # ---- RAG: inject relevant context ----
         if self.enable_rag and self.retriever:
             rag_context = self.retriever.retrieve_context(
@@ -141,7 +147,7 @@ class DeepSeekAgent:
         # ---- Tool-calling loop ----
         if self.enable_tools and self.tool_registry.tool_names:
             final_text = self.tool_executor.run(
-                messages=self.conv_memory.as_list(),
+                messages=self.context_manager.build(self.conv_memory.as_list()).messages,
                 reasoning_effort=self.reasoning_effort,
                 extra_body=self._extra_body(),
             )
@@ -162,7 +168,7 @@ class DeepSeekAgent:
         return final_text
 
 
-    def ask_stream(self, user_input: str):
+    def ask_stream(self, user_input: str, run_context: RunContext | None = None):
         if self.enable_rag and self.retriever:
             rag_context = self.retriever.retrieve_context(
                 user_input, top_k=self.rag_top_k, max_chars=self.rag_max_context_chars
@@ -182,16 +188,19 @@ class DeepSeekAgent:
         accumulated = ""
         if self.enable_tools and self.tool_registry.tool_names:
             for chunk in self.tool_executor.run_stream(
-                messages=self.conv_memory.as_list(),
+                messages=self.context_manager.build(self.conv_memory.as_list()).messages,
                 reasoning_effort=self.reasoning_effort,
                 extra_body=self._extra_body(),
+                run_context=run_context,
             ):
                 accumulated += chunk
                 yield chunk
         else:
             stream = self.client.chat.completions.create(
                 model=self.model, messages=self.conv_memory.as_list(),
-                stream=True, reasoning_effort=self.reasoning_effort,
+                stream=True,
+                stream_options={"include_usage": True},
+                reasoning_effort=self.reasoning_effort,
                 extra_body=self._extra_body(),
             )
             for chunk in stream:

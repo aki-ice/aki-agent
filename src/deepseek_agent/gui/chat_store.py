@@ -7,6 +7,15 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
+class ChatSearchResult:
+    session_id: int
+    session_title: str
+    role: str
+    snippet: str
+    created_at: str
+
+
+@dataclass(frozen=True)
 class ChatSession:
     id: int
     title: str
@@ -20,6 +29,7 @@ class ChatStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self._init_fts()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -51,6 +61,19 @@ class ChatStore:
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id);
                 """
             )
+
+    def _init_fts(self) -> None:
+        with self._connect() as conn:
+            try:
+                conn.executescript("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS chat_messages_fts USING fts5(content, role UNINDEXED, session_id UNINDEXED, content='chat_messages', content_rowid='id');
+                    CREATE TRIGGER IF NOT EXISTS chat_messages_ai AFTER INSERT ON chat_messages BEGIN INSERT INTO chat_messages_fts(rowid, content, role, session_id) VALUES (new.id, new.content, new.role, new.session_id); END;
+                    CREATE TRIGGER IF NOT EXISTS chat_messages_ad AFTER DELETE ON chat_messages BEGIN INSERT INTO chat_messages_fts(chat_messages_fts, rowid, content, role, session_id) VALUES ('delete', old.id, old.content, old.role, old.session_id); END;
+                    INSERT INTO chat_messages_fts(chat_messages_fts) VALUES ('rebuild');
+                """)
+                self.fts_enabled = True
+            except sqlite3.OperationalError:
+                self.fts_enabled = False
 
     def create_session(self, title: str = "新对话", model: str = "") -> int:
         now = datetime.now().isoformat(timespec="seconds")
@@ -107,6 +130,23 @@ class ChatStore:
         now = datetime.now().isoformat(timespec="seconds")
         with self._connect() as conn:
             conn.execute("UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?", (title, now, session_id))
+
+    def search(self, query: str, limit: int = 50) -> list[ChatSearchResult]:
+        query = query.strip()
+        if not query:
+            return []
+        with self._connect() as conn:
+            if self.fts_enabled:
+                rows = conn.execute(
+                    "SELECT f.session_id, s.title, f.role, snippet(chat_messages_fts, 0, '[', ']', '…', 24) AS snippet, m.created_at FROM chat_messages_fts f JOIN chat_messages m ON m.id=f.rowid JOIN chat_sessions s ON s.id=f.session_id WHERE chat_messages_fts MATCH ? ORDER BY bm25(chat_messages_fts) LIMIT ?",
+                    (query, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT m.session_id, s.title, m.role, substr(m.content, 1, 300) AS snippet, m.created_at FROM chat_messages m JOIN chat_sessions s ON s.id=m.session_id WHERE m.content LIKE ? ORDER BY m.id DESC LIMIT ?",
+                    (f"%{query}%", limit),
+                ).fetchall()
+        return [ChatSearchResult(int(row["session_id"]), str(row["title"]), str(row["role"]), str(row["snippet"]), str(row["created_at"])) for row in rows]
 
     def delete_session(self, session_id: int) -> None:
         with self._connect() as conn:

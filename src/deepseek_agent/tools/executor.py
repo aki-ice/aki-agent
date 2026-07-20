@@ -3,16 +3,21 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from typing import Any
 
 from openai import OpenAI
 
+from ..runtime import AgentError, CancelledError, ErrorCategory, RunContext, RunStatus, RunStore, ToolResult, Usage
 from .base import ToolRegistry
 
 logger = logging.getLogger(__name__)
 Message = dict[str, Any]
 FILE_MUTATION_TOOLS = {"write_file", "edit_file", "create_directory", "delete_path", "copy_path", "move_path"}
+APPROVAL_TOOLS = {"write_file", "edit_file", "create_directory", "copy_path", "move_path"}
+ALWAYS_APPROVAL_TOOLS = {"delete_path", "run_command", "run_code", "docker_sandbox", "git"}
 
 
 @dataclass(frozen=True)
@@ -22,14 +27,18 @@ class TextToolCall:
 
 
 class ToolExecutor:
-    def __init__(self, client: OpenAI, model: str, registry: ToolRegistry, max_rounds: int = 5) -> None:
+    def __init__(self, client: OpenAI, model: str, registry: ToolRegistry, max_rounds: int = 5, run_store: RunStore | None = None) -> None:
         self.client = client
         self.model = model
         self.registry = registry
         self.max_rounds = max_rounds
-        self._last_tool_results: list[tuple[str, str]] = []
+        self.run_store = run_store
+        self._last_tool_results: list[tuple[str, ToolResult]] = []
+        self.last_usage = Usage()
+        self._context: RunContext | None = None
 
-    def run(self, messages: list[Message], *, reasoning_effort: str = "medium", extra_body: dict[str, Any] | None = None) -> str:
+    def run(self, messages: list[Message], *, reasoning_effort: str = "medium", extra_body: dict[str, Any] | None = None, run_context: RunContext | None = None) -> str:
+        self._begin_run(run_context)
         tools = self.registry.list_definitions()
         if not tools:
             resp = self.client.chat.completions.create(
@@ -38,6 +47,7 @@ class ToolExecutor:
                 reasoning_effort=reasoning_effort,
                 extra_body=extra_body or {},
             )
+            self._capture_usage(resp)
             return resp.choices[0].message.content or ""
 
         for _ in range(self.max_rounds):
@@ -48,6 +58,8 @@ class ToolExecutor:
                 reasoning_effort=reasoning_effort,
                 extra_body=extra_body or {},
             )
+            self._checkpoint()
+            self._capture_usage(resp)
             choice = resp.choices[0]
 
             if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
@@ -66,12 +78,15 @@ class ToolExecutor:
                 if direct_answer:
                     return direct_answer
                 continue
+            if self._last_user_requires_ocr(messages) and not any(name == "paddle_ocr" for name, _ in self._last_tool_results):
+                return "未执行 OCR：没有检测到真实的 paddle_ocr 工具调用。请确认工具已启用且 OCR 服务已配置。"
             if self._last_user_requires_file_mutation(messages) and not self._has_file_mutation_result():
                 return "未执行文件操作：没有检测到真实的文件工具调用。请确认 write_file/edit_file 等工具已启用后重试。"
             return self._clean_visible_tool_markup(content)
         return self._finalize_after_max_rounds(messages, reasoning_effort, extra_body)
 
-    def run_stream(self, messages: list[Message], *, reasoning_effort: str = "medium", extra_body: dict[str, Any] | None = None):
+    def run_stream(self, messages: list[Message], *, reasoning_effort: str = "medium", extra_body: dict[str, Any] | None = None, run_context: RunContext | None = None):
+        self._begin_run(run_context)
         tools = self.registry.list_definitions()
         if not tools:
             yield from self._stream_text(messages, reasoning_effort, extra_body)
@@ -85,6 +100,8 @@ class ToolExecutor:
                 reasoning_effort=reasoning_effort,
                 extra_body=extra_body or {},
             )
+            self._checkpoint()
+            self._capture_usage(resp)
             choice = resp.choices[0]
 
             if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
@@ -106,6 +123,9 @@ class ToolExecutor:
                     return
                 continue
 
+            if self._last_user_requires_ocr(messages) and not any(name == "paddle_ocr" for name, _ in self._last_tool_results):
+                yield "未执行 OCR：没有检测到真实的 paddle_ocr 工具调用。请确认工具已启用且 OCR 服务已配置。"
+                return
             if self._last_user_requires_file_mutation(messages) and not self._has_file_mutation_result():
                 yield "未执行文件操作：没有检测到真实的文件工具调用。请确认 write_file/edit_file 等工具已启用后重试。"
                 return
@@ -117,6 +137,72 @@ class ToolExecutor:
         if final_text:
             yield final_text
 
+    def _begin_run(self, run_context: RunContext | None) -> None:
+        self._context = run_context
+        self.last_usage = Usage()
+        self._last_tool_results = []
+        self._checkpoint()
+
+    def _checkpoint(self) -> None:
+        if self._context:
+            self._context.checkpoint()
+
+    def _capture_usage(self, response: Any) -> None:
+        usage = Usage.from_response(response)
+        self.last_usage.add(usage)
+        if self._context:
+            self._context.usage.add(usage)
+            self._context.emit("model.completed", {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens})
+
+    def _execute_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        self._checkpoint()
+        context = self._context
+        risk = "high" if name in ALWAYS_APPROVAL_TOOLS else "medium" if name in APPROVAL_TOOLS else "low"
+        if risk != "low" and context and context.approval_callback:
+            context.emit("approval.requested", {"tool": name, "risk": risk})
+            allowed = context.approval_callback(name, arguments, risk)
+            if self.run_store:
+                self.run_store.add_approval(context.run_id, name, arguments, risk, allowed)
+            if not allowed:
+                error = AgentError(ErrorCategory.PERMISSION, "approval_denied", f"User denied tool '{name}'")
+                result = ToolResult(False, error.message, error)
+                context.emit("approval.denied", {"tool": name})
+                return result
+            context.emit("approval.allowed", {"tool": name})
+        if context:
+            context.emit("tool.started", {"tool": name})
+        timeout = context.tool_timeout_seconds if context else 300
+        execution_arguments = dict(arguments)
+        if context and name == "paddle_ocr":
+            execution_arguments["_cancellation_token"] = context.cancellation
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}")
+        future = pool.submit(self.registry.execute_result, name, execution_arguments)
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                self._checkpoint()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise FutureTimeout()
+                try:
+                    result = future.result(timeout=min(0.2, remaining))
+                    break
+                except FutureTimeout:
+                    if time.monotonic() >= deadline:
+                        raise
+        except FutureTimeout:
+            future.cancel()
+            error = AgentError(ErrorCategory.TIMEOUT, "tool_timeout", f"Tool '{name}' exceeded {timeout} seconds", True)
+            result = ToolResult(False, error.message, error, duration_ms=timeout * 1000)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        if self.run_store and context:
+            self.run_store.add_tool_call(context.run_id, name, arguments, result)
+        if context:
+            context.emit("tool.completed", {"tool": name, "ok": result.ok, "duration_ms": result.duration_ms})
+        self._checkpoint()
+        return result
+
     def _handle_openai_tool_calls(self, messages: list[Message], message: Any) -> None:
         self._last_tool_results = []
         messages.append(message.model_dump())
@@ -127,18 +213,18 @@ class ToolExecutor:
             except json.JSONDecodeError:
                 tool_args = {}
             logger.info("Tool call: %s(%s)", tool_name, tool_args)
-            result = self.registry.execute(tool_name, tool_args)
+            result = self._execute_tool(tool_name, tool_args)
             self._last_tool_results.append((tool_name, result))
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result.to_model_text()})
 
     def _handle_text_tool_calls(self, messages: list[Message], calls: list[TextToolCall]) -> None:
         self._last_tool_results = []
         result_blocks: list[str] = []
         for call in calls:
             logger.info("Text tool call: %s(%s)", call.name, call.arguments)
-            result = self.registry.execute(call.name, call.arguments)
+            result = self._execute_tool(call.name, call.arguments)
             self._last_tool_results.append((call.name, result))
-            result_blocks.append(f"Tool `{call.name}` result:\n{result}")
+            result_blocks.append(f"Tool `{call.name}` result:\n{result.to_model_text()}")
         messages.append({
             "role": "user",
             "content": "\n\n".join(result_blocks) + "\n\n请基于工具结果直接回答用户，不要输出工具调用标记。",
@@ -150,14 +236,22 @@ class ToolExecutor:
             return ""
         lines: list[str] = []
         for name, result in mutation_results:
-            lowered = result.lower()
-            ok = not any(marker in lowered for marker in ["error", "not found", "no changes made", "permission denied"])
-            status = "已执行" if ok else "未成功"
-            lines.append(f"{status} `{name}`：{result}")
+            status = "已执行" if result.ok else "未成功"
+            lines.append(f"{status} `{name}`：{result.content}")
         return "\n".join(lines)
 
     def _has_file_mutation_result(self) -> bool:
         return any(name in FILE_MUTATION_TOOLS for name, _ in self._last_tool_results)
+
+    def _last_user_requires_ocr(self, messages: list[Message]) -> bool:
+        last_user = self._last_user_text(messages)
+        if not last_user:
+            return False
+        markers = [
+            "paddle_ocr", "ocr", "解析图片", "识别图片", "解析文件", "识别文件", "解析文档", "识别文档", "文档 / 图片",
+            ".png", ".jpg", ".jpeg", ".webp", ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
+        ]
+        return any(marker in last_user for marker in markers)
 
     def _last_user_is_file_only_mutation(self, messages: list[Message]) -> bool:
         last_user = self._last_user_text(messages)
@@ -211,7 +305,13 @@ class ToolExecutor:
             extra_body=extra_body or {},
         )
         for chunk in stream:
-            delta = chunk.choices[0].delta
+            self._checkpoint()
+            usage = Usage.from_response(chunk)
+            if usage.total_tokens:
+                self.last_usage.add(usage)
+                if self._context:
+                    self._context.usage.add(usage)
+            delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
                 cleaned = self._clean_visible_tool_markup(delta.content)
                 if cleaned:
@@ -231,6 +331,7 @@ class ToolExecutor:
             extra_body=extra_body or {},
         )
         content = resp.choices[0].message.content or ""
+        self._capture_usage(resp)
         return self._clean_visible_tool_markup(content) or "工具调用次数已达上限，未能得到可展示的最终回答。"
 
     def _parse_text_tool_calls(self, content: str) -> list[TextToolCall]:
@@ -277,6 +378,9 @@ class ToolExecutor:
             "replace_file_text": "edit_file",
             "insert_file_text": "edit_file",
             "delete_file_text": "edit_file",
+            "dots_ocr": "paddle_ocr",
+            "ocr_document": "paddle_ocr",
+            "parse_document": "paddle_ocr",
         }
         return aliases.get(name.strip(), name.strip())
 

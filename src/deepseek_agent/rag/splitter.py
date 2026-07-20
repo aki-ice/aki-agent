@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -10,6 +9,7 @@ class TextChunk:
     source: str
     chunk_index: int
     title: str = ""
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 class RecursiveCharacterSplitter:
@@ -23,8 +23,16 @@ class RecursiveCharacterSplitter:
 
     def split_document(self, document: "Document") -> list[TextChunk]:  # noqa: F821
         chunks = self.split(document.content)
-        return [TextChunk(text=chunk, source=document.source, chunk_index=i, title=document.title)
-                for i, chunk in enumerate(chunks)]
+        return [
+            TextChunk(
+                text=chunk,
+                source=document.source,
+                chunk_index=i,
+                title=document.title,
+                metadata={**document.metadata, "page": document.page},
+            )
+            for i, chunk in enumerate(chunks)
+        ]
 
     def _split_recursive(self, text: str, separators: list[str]) -> list[str]:
         final: list[str] = []
@@ -34,11 +42,8 @@ class RecursiveCharacterSplitter:
                 separator = sep
                 break
         if separator == "":
-            for i in range(0, len(text), self.chunk_size - self.chunk_overlap):
-                chunk = text[i:i + self.chunk_size]
-                if chunk:
-                    final.append(chunk)
-            return final
+            step = max(1, self.chunk_size - self.chunk_overlap)
+            return [text[i:i + self.chunk_size] for i in range(0, len(text), step) if text[i:i + self.chunk_size]]
 
         splits = text.split(separator)
         current = ""
@@ -50,8 +55,7 @@ class RecursiveCharacterSplitter:
                     final.append(current)
                 if len(part) > self.chunk_size:
                     idx = separators.index(separator)
-                    next_seps = separators[idx + 1:]
-                    final.extend(self._split_recursive(part, next_seps))
+                    final.extend(self._split_recursive(part, separators[idx + 1:]))
                     current = ""
                 else:
                     current = part

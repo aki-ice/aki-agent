@@ -42,7 +42,8 @@ class StatsStore:
                     message_count INTEGER NOT NULL DEFAULT 0,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
-                    total_tokens INTEGER NOT NULL DEFAULT 0
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    usage_estimated INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS messages (

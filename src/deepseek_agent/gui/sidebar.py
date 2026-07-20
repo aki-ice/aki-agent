@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -270,12 +271,27 @@ class Sidebar(QWidget):
         nav_title.setStyleSheet(f"color: {C['muted']}; font-size: 10px; font-weight: 900; padding-left: 4px;")
         layout.addWidget(nav_title)
 
-        nav_items = [("首页", "Dashboard"), ("对话", "Chat"), ("模型", "Model"), ("记忆", "Memory"), ("团队", "Team"), ("技能", "SkillsTools"), ("令牌", "Tokens")]
+        nav_scroll = QScrollArea()
+        nav_scroll.setWidgetResizable(True)
+        nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        nav_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        nav_scroll.setFixedHeight(350)
+        nav_scroll.setStyleSheet(f"QScrollArea {{ background: transparent; border: none; }} QScrollBar:vertical {{ width: 7px; background: {C['panel_deep']}; margin: 2px 0; }} QScrollBar::handle:vertical {{ background: {C['muted']}; border-radius: 3px; min-height: 28px; }} QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}")
+        nav_container = QWidget()
+        nav_container.setStyleSheet("background: transparent;")
+        nav_layout = QVBoxLayout(nav_container)
+        nav_layout.setContentsMargins(0, 0, 4, 0)
+        nav_layout.setSpacing(4)
+        nav_items = [("首页", "Dashboard"), ("对话", "Chat"), ("模型", "Model"), ("日记", "Memory"), ("长期", "LongMemory"), ("文件", "Files"), ("知识", "Knowledge"), ("工作流", "Workflows"), ("任务", "Operations"), ("团队", "Team"), ("技能", "SkillsTools"), ("令牌", "Tokens")]
         for icon, label in nav_items:
             btn = NavButton(icon, label)
             btn.clicked.connect(lambda checked, l=label: self._on_nav(l))
             self._nav_buttons[label] = btn
-            layout.addWidget(btn)
+            nav_layout.addWidget(btn)
+        nav_layout.addStretch()
+        nav_scroll.setWidget(nav_container)
+        layout.addWidget(nav_scroll)
 
         token_card = self._card()
         tl = QVBoxLayout(token_card)
